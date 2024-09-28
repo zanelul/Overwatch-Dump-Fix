@@ -5,7 +5,7 @@
 #include "ntdll.h"
 #include "plugin.h"
 
-#include "..\hde\hde.h"
+#include "..\zydis\zydis.h"
 
 
 //
@@ -103,154 +103,106 @@ exit:
     return status;
 }
 
+struct SContext {
+    ZyanU64 Registers[ZYDIS_REGISTER_MAX_VALUE];
+    ZydisRegister RegisterValues[2];
+    ZyanU64 ImmediateValue;
+};
 
-//
-// Instruction format values used in the deobfuscation code.
-//
-#define INSN_OPCODE_IMUL                    0x0F
-#define INSN_OPCODE_MOV_R64_IMM64           0xB8
-#define INSN_OPCODE_MOV_R64_IMM64_RAX_R10   0xBA
-#define INSN_OPCODE_ADD_R64_IMM32           0x05
-#define INSN_OPCODE_SUB_R64_IMM32           0x2D
-#define INSN_OPCODE_XOR_R64_IMM32           0x35
-#define INSN_OPCODE_JMP_REL32               0xE9
-#define INSN_OPCODE_JMP_REG                 0xFF
+void GetInstructionContext(ZydisDisassembledInstruction Instruction, SContext* Context) {
+    for (int i = 0; i < Instruction.info.operand_count; ++i) {
+        ZydisDecodedOperand& Operand = Instruction.operands[i];
 
+        if (Operand.type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            if (Operand.reg.value == ZYDIS_REGISTER_RFLAGS || Operand.reg.value == ZYDIS_REGISTER_RIP) {
+                continue;
+            }
 
-//
+            if (Context->RegisterValues[0] == ZYDIS_REGISTER_NONE) {
+                Context->RegisterValues[0] = Operand.reg.value;
+            }
+            else {
+                Context->RegisterValues[1] = Operand.reg.value;
+            }
+        }
+        else if (Operand.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+            Context->ImmediateValue = Operand.imm.value.u;
+        }
+    }
+}
+
 // IdfpDeobfuscateEntry
 //
 _Check_return_
 BOOL
 IdfpDeobfuscateEntry(
-    _In_ PVOID pEmulationBuffer,
-    _In_ PVOID pDeobfuscationPage,
-    _In_ ULONG_PTR EntryOffset,
+    _In_ HANDLE hProcess,
+    _In_ ULONG_PTR pObfuscatedEntry,
     _Out_ PULONG_PTR pDeobfuscatedEntry
 )
 {
-    HDE_DISASSEMBLY Disassembly = {};
-    UINT cbInstruction = 0;
-    ULONG_PTR IntermediateEntry = 0;
-    BOOLEAN fIsBranchInstruction = FALSE;
+    ZydisDisassembledInstruction Instruction;
+    SContext Context{};
     ULONG_PTR DeobfuscatedEntry = 0;
+    ZyanU64 Address = pObfuscatedEntry;
     BOOL status = TRUE;
 
     // Zero out parameters.
     *pDeobfuscatedEntry = NULL;
 
-    // Storing r10 value during 0xBA (mov r10, imm64) operation
-    ULONG64 r10 = 0;
+    // Emulate the instruction
+    while (!DeobfuscatedEntry) {
+        ZeroMemory(Context.RegisterValues, 2);
 
-    for (PVOID pInstruction = (PVOID)((ULONG_PTR)pEmulationBuffer + EntryOffset);
-        pInstruction >= pEmulationBuffer &&
-        pInstruction < (PVOID)((ULONG_PTR)pEmulationBuffer + PAGE_SIZE);
-        /**/)
-    {
-        //
-        // Reset instruction state parameters.
-        //
-        fIsBranchInstruction = FALSE;
+        BYTE ByteCodes[10];
+        ReadProcessMemory(hProcess, (LPCVOID)Address, &ByteCodes, 10, nullptr);
+        ZydisDisassembleIntel(ZYDIS_MACHINE_MODE_LONG_64, Address, ByteCodes, 10, &Instruction);
+        GetInstructionContext(Instruction, &Context);
+        Address += Instruction.info.length;
+        //INF_PRINT("Emulating: %s", Instruction.text);
 
-        cbInstruction = HdeDisassemble(pInstruction, &Disassembly);
-        if (!cbInstruction)
-        {
-            ERR_PRINT("HdeDisassemble failed for remote address: %p\n",
-                (ULONG_PTR)pDeobfuscationPage +
-                (ULONG_PTR)pInstruction -
-                (ULONG_PTR)pEmulationBuffer);
-            status = FALSE;
-            goto exit;
+        switch (Instruction.info.mnemonic) {
+        case ZYDIS_MNEMONIC_MOV: {
+            Context.Registers[Context.RegisterValues[0]] = Context.ImmediateValue;
+            break;
         }
-        //
-        if (F_ERROR & Disassembly.flags)
-        {
-            ERR_PRINT("Encountered invalid instruction at %p\n",
-                (ULONG_PTR)pDeobfuscationPage +
-                (ULONG_PTR)pInstruction -
-                (ULONG_PTR)pEmulationBuffer);
-            status = FALSE;
-            goto exit;
+        case ZYDIS_MNEMONIC_XOR: {
+            Context.Registers[Context.RegisterValues[0]] ^= Context.ImmediateValue;
+            break;
         }
-
-        //
-        // Emulate the instruction and apply all side effects to our
-        //  intermediate entry value.
-        //
-        switch (Disassembly.opcode)
-        {
-        case INSN_OPCODE_MOV_R64_IMM64_RAX_R10:
-            // Store r10 value from the operation (used later)
-            r10 = Disassembly.imm.imm64;
-            break;
-
-        case INSN_OPCODE_MOV_R64_IMM64:
-            IntermediateEntry = Disassembly.imm.imm64;
-            break;
-
-        case INSN_OPCODE_ADD_R64_IMM32:
-            IntermediateEntry += Disassembly.imm.imm32;
-            break;
-
-        case INSN_OPCODE_SUB_R64_IMM32:
-            IntermediateEntry -= Disassembly.imm.imm32;
-            break;
-
-        case INSN_OPCODE_XOR_R64_IMM32:
-            IntermediateEntry ^= Disassembly.imm.imm32;
-            break;
-
-        case INSN_OPCODE_JMP_REL32:
-            pInstruction = (PVOID)(
-                (ULONG_PTR)pInstruction +
-                cbInstruction +
-                (LONG)Disassembly.imm.imm32);
-
-            fIsBranchInstruction = TRUE;
-
-            break;
-
-        case INSN_OPCODE_JMP_REG:
-            DeobfuscatedEntry = IntermediateEntry;
-            break;
-
-        case INSN_OPCODE_IMUL:
-            // Handle our errors, just in case so we don't have to look forever later
-            if (r10 == 0)
-            {
-                ERR_PRINT("r10 == 0, opcode: 0x%X\n", Disassembly.opcode);
-                status = FALSE;
-                goto exit;
+        case ZYDIS_MNEMONIC_IMUL: {
+            if (Context.RegisterValues[1] != ZYDIS_REGISTER_NONE) {
+                Context.Registers[Context.RegisterValues[0]] *= Context.Registers[Context.RegisterValues[1]];
             }
-            // Multiply with r10 stored value
-            IntermediateEntry *= r10;
-            // reset r10 (dont know if this makes a difference but good practice I guess?)
-            r10 = 0;
+            else {
+                Context.Registers[Context.RegisterValues[0]] *= Context.ImmediateValue;
+            }
             break;
-
-        default:
-            ERR_PRINT("Unhandled opcode: 0x%X\n", Disassembly.opcode);
-            status = FALSE;
-            goto exit;
         }
-
-        //
-        // Emulate execution flow if this is not a branch instruction.
-        //
-        if (!fIsBranchInstruction)
-        {
-            pInstruction = (PVOID)((ULONG_PTR)pInstruction + cbInstruction);
-        }
-
-        //
-        // Exit if deobfuscation is complete.
-        //
-        if (DeobfuscatedEntry)
-        {
+        case ZYDIS_MNEMONIC_ADD: {
+            Context.Registers[Context.RegisterValues[0]] += Context.ImmediateValue;
             break;
+        }
+        case ZYDIS_MNEMONIC_SUB: {
+            Context.Registers[Context.RegisterValues[0]] -= Context.ImmediateValue;
+            break;
+        }
+        case ZYDIS_MNEMONIC_JMP: {
+            if (Context.RegisterValues[0] != ZYDIS_REGISTER_NONE) {
+                DeobfuscatedEntry = Context.Registers[Context.RegisterValues[0]];
+            }
+            else {
+                Address += Context.ImmediateValue;
+            }
+            break;
+        }
+        default: {
+            ERR_PRINT("IdfpDeobfuscateEntry failed to emulate instruction");
+            break;
+        }
         }
     }
-    //
+    
     if (!DeobfuscatedEntry)
     {
         ERR_PRINT("Failed to deobfuscate entry.\n");
@@ -287,24 +239,10 @@ IdfpDeobfuscateIatEntries(
     _In_ SIZE_T cIatEntries
 )
 {
-    PVOID pEmulationBuffer = NULL;
     PVOID pDeobfuscationPage = NULL;
-    ULONG_PTR EntryOffset = 0;
     ULONG_PTR DeobfuscatedEntry = 0;
     SIZE_T cDeobfuscatedEntries = 0;
     BOOL status = TRUE;
-
-    //
-    // Allocate a page aligned buffer to store the contents of the
-    //  deobfuscation page in the remote process.
-    //
-    pEmulationBuffer = _aligned_malloc(EMULATION_BUFFER_SIZE, PAGE_SIZE);
-    if (!pEmulationBuffer)
-    {
-        ERR_PRINT("_aligned_malloc failed: %d\n", errno);
-        status = FALSE;
-        goto exit;
-    }
 
     //
     // Deobfuscate all IAT entries.
@@ -320,42 +258,13 @@ IdfpDeobfuscateIatEntries(
         }
 
         //
-        // Reset the emulation buffer for each entry.
-        //
-        RtlSecureZeroMemory(pEmulationBuffer, EMULATION_BUFFER_SIZE);
-
-        //
-        // Calculate the address of the page containing the deobfuscation code
-        //  for this entry.
-        //
-        pDeobfuscationPage = (PVOID)ALIGN_DOWN_BY(pIatEntries[i], PAGE_SIZE);
-
-        //
         // TODO We should VirtualQuery the deobfuscation page to verify that it
         //  is valid and readable.
         //
-        status = ReadProcessMemory(
-            hProcess,
-            pDeobfuscationPage,
-            pEmulationBuffer,
-            PAGE_SIZE,
-            NULL);
-        if (!status)
-        {
-            ERR_PRINT(
-                "ReadProcessMemory failed: %u. (Address = %p, Size = 0x%IX)\n",
-                GetLastError(),
-                pDeobfuscationPage,
-                PAGE_SIZE);
-            goto exit;
-        }
-
-        EntryOffset = BYTE_OFFSET(pIatEntries[i]);
 
         status = IdfpDeobfuscateEntry(
-            pEmulationBuffer,
-            pDeobfuscationPage,
-            EntryOffset,
+            hProcess,
+            pIatEntries[i],
             &DeobfuscatedEntry);
         if (!status)
         {
@@ -376,11 +285,6 @@ IdfpDeobfuscateIatEntries(
         cDeobfuscatedEntries);
 
 exit:
-    if (pEmulationBuffer)
-    {
-        _aligned_free(pEmulationBuffer);
-    }
-
     return status;
 }
 
