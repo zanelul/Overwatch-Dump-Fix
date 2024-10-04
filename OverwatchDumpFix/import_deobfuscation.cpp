@@ -155,7 +155,9 @@ IdfpDeobfuscateEntry(
         ZeroMemory(Context.RegisterValues, 2);
 
         BYTE ByteCodes[10];
-        ReadProcessMemory(hProcess, (LPCVOID)Address, &ByteCodes, 10, nullptr);
+        if (!ReadProcessMemory(hProcess, (LPCVOID)Address, &ByteCodes, 10, nullptr)) {
+            ReadProcessMemory(hProcess, (LPCVOID)Address, &ByteCodes, 6, nullptr);
+        }
         ZydisDisassembleIntel(ZYDIS_MACHINE_MODE_LONG_64, Address, ByteCodes, 10, &Instruction);
         GetInstructionContext(Instruction, &Context);
         Address += Instruction.info.length;
